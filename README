@@ -442,6 +442,27 @@ Directives
 
     description: set the timeout value of sending to backends.
 
+   forward_source_ip
+    syntax: *forward_source_ip [on|off]*
+    
+    default: *off*
+    
+    context: *tcp, server*
+    
+    description: forward source ip of client to upstream using IPFP (ip forwarding protocol).
+    Note that the client must be capable of parsing IPFP header properly.
+
+   forward_once
+    syntax: *forward_once [on|off|yes|no|once]*
+    
+    default: *on*
+    
+    context: *tcp, server*
+    
+    description: forward source ip of client to upstream ONLY ONCE (for first packet in the session).
+    Note that setting this preference with value, while forward_source_ip=off (or not set) will
+    result with configuration error on nginx start up.
+
   ngx_tcp_websocket_module
    websocket_pass
     syntax: *websocket_pass [path] host:port*

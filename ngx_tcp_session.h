@@ -39,6 +39,9 @@ typedef struct ngx_tcp_session_s {
     ngx_str_t              *addr_text;
     ngx_str_t               host;
 
+    ngx_tcp_forward_source_ip_state_t *forwarder_state;
+    ngx_flag_t              forwarded_once;
+
 } ngx_tcp_session_t;
 
 

@@ -1,8 +1,8 @@
 
-
 #include <ngx_config.h>
 #include <ngx_core.h>
 #include <ngx_tcp.h>
+#include <ngx_tcp_forward_source_ip.h>
 
 
 typedef struct ngx_tcp_proxy_s {
@@ -16,6 +16,9 @@ typedef struct ngx_tcp_proxy_conf_s {
 
     ngx_str_t                 url;
     size_t                    buffer_size;
+
+    ngx_flag_t                forward_source_ip;
+    ngx_flag_t                forward_once;
 } ngx_tcp_proxy_conf_t;
 
 
@@ -45,6 +48,14 @@ static ngx_tcp_protocol_t  ngx_tcp_generic_protocol = {
 
 };
 
+static ngx_conf_enum_t  ngx_tcp_forward_once[] = {
+    { ngx_string("off"), 0 },
+    { ngx_string("on"), 1 },
+    { ngx_string("no"), 0 },
+    { ngx_string("yes"), 1 },
+    { ngx_string("once"), 1 },
+    { ngx_null_string, 0 }
+};
 
 static ngx_command_t  ngx_tcp_proxy_commands[] = {
 
@@ -82,6 +93,20 @@ static ngx_command_t  ngx_tcp_proxy_commands[] = {
       NGX_TCP_SRV_CONF_OFFSET,
       offsetof(ngx_tcp_proxy_conf_t, upstream.send_timeout),
       NULL },
+
+    { ngx_string("forward_source_ip"),
+      NGX_TCP_MAIN_CONF|NGX_TCP_SRV_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+      NGX_TCP_SRV_CONF_OFFSET,
+      offsetof(ngx_tcp_proxy_conf_t, forward_source_ip),
+      NULL },
+
+    { ngx_string("forward_once"),
+      NGX_TCP_MAIN_CONF|NGX_TCP_SRV_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_enum_slot,
+      NGX_TCP_SRV_CONF_OFFSET,
+      offsetof(ngx_tcp_proxy_conf_t, forward_once),
+      &ngx_tcp_forward_once },
 
     ngx_null_command
 };
@@ -133,6 +158,19 @@ ngx_tcp_proxy_init_session(ngx_tcp_session_t *s)
     if (s->buffer == NULL) {
         ngx_tcp_finalize_session(s);
         return;
+    }
+
+    s->forwarder_state = ngx_pcalloc(s->connection->pool, sizeof(ngx_tcp_forward_source_ip_state_t));
+    s->forwarded_once = 0;
+
+    if(pcf->forward_source_ip){
+
+        s->forwarder_state->buffer = ngx_create_temp_buf(s->connection->pool, pcf->buffer_size);
+        s->forwarder_state->buffer->pos = s->forwarder_state->buffer->end;
+        s->forwarder_state->buffer->last = s->forwarder_state->buffer->end;
+
+    } else {
+        s->forwarder_state->buffer = 0;
     }
 
     s->out.len = 0;
@@ -307,17 +345,20 @@ ngx_tcp_proxy_handler(ngx_event_t *ev)
     ssize_t                   n;
     ngx_buf_t                *b;
     ngx_err_t                 err;
-    ngx_uint_t                do_write, first_read;
+    ngx_uint_t                do_write, first_read, forward_ip, forward_cycle, forward_restore;
     ngx_connection_t         *c, *src, *dst;
     ngx_tcp_session_t        *s;
     ngx_tcp_proxy_conf_t     *pcf;
     ngx_tcp_proxy_ctx_t      *pctx;
     ngx_tcp_core_srv_conf_t  *cscf;
+    int                       forward_result;
 
     c = ev->data;
     s = c->data;
+    forward_ip = 0;
 
     cscf = ngx_tcp_get_module_srv_conf(s, ngx_tcp_core_module);
+    pcf = ngx_tcp_get_module_srv_conf(s, ngx_tcp_proxy_module);
 
     if (ev->timedout) {
         c->log->action = "proxying";
@@ -354,6 +395,7 @@ ngx_tcp_proxy_handler(ngx_event_t *ev)
             dst = pctx->upstream->connection;
             b = s->buffer;
             read_bytes = &s->bytes_read;
+            forward_ip = pcf->forward_source_ip ? 1 : 0;
         }
 
     } else {
@@ -364,6 +406,7 @@ ngx_tcp_proxy_handler(ngx_event_t *ev)
             dst = c;
             b = s->buffer;
             read_bytes = &s->bytes_read;
+            forward_ip = pcf->forward_source_ip ? 1 : 0;
         } else {
             recv_action = "upstream read: proxying and reading from upstream";
             send_action = "upstream read: proxying and sending to client";
@@ -393,34 +436,78 @@ ngx_tcp_proxy_handler(ngx_event_t *ev)
 
         if (do_write) {
 
-            size = b->last - b->pos;
+            forward_cycle = 1;
+            forward_restore = 0;
 
-            if (size && dst->write->ready) {
-                c->log->action = send_action;
+            while(forward_cycle) {
 
-                n = dst->send(dst, b->pos, size);
-                err = ngx_socket_errno;
+                if(forward_ip && !forward_restore && !(pcf->forward_once && s->forwarded_once)) {
 
-                ngx_log_debug1(NGX_LOG_DEBUG_TCP, ev->log, 0,
-                               "tcp proxy handler send:%d", n);
+                    forward_result = ngx_tcp_proxy_handle_ip_forwarding(s->connection, s->forwarder_state, b);
 
-                if (n == NGX_ERROR) {
-                    ngx_log_error(NGX_LOG_ERR, c->log, err, "proxy send error");
+                    if(forward_result < 0) {
 
-                    ngx_tcp_finalize_session(s);
-                    return;
-                }
-
-                if (n > 0) {
-                    b->pos += n;
-
-                    if (write_bytes) {
-                        *write_bytes += n;
+                        ngx_tcp_finalize_session(s);
+                        return;
                     }
 
-                    if (b->pos == b->last) {
-                        b->pos = b->start;
-                        b->last = b->start;
+                    s->forwarded_once = 1;
+                    forward_cycle = forward_result > 0 ? 1 : 0;
+
+                    if(forward_cycle)
+                      ngx_log_debug1(NGX_LOG_DEBUG_TCP, ev->log, 0,
+                                     "tcp proxy handler ip forwarding not all data fit in original buffer:%d",
+                                     forward_result);
+
+                } else {
+
+                    forward_cycle = 0;
+                }
+
+                size = b->last - b->pos;
+
+                if (size && dst->write->ready) {
+                    c->log->action = send_action;
+
+                    n = dst->send(dst, b->pos, size);
+                    err = ngx_socket_errno;
+
+                    ngx_log_debug1(NGX_LOG_DEBUG_TCP, ev->log, 0,
+                                   "tcp proxy handler send:%d", n);
+
+                    if (n == NGX_ERROR) {
+                        ngx_log_error(NGX_LOG_ERR, c->log, err, "proxy send error");
+
+                        ngx_tcp_finalize_session(s);
+                        return;
+                    }
+
+                    if (n > 0) {
+                        b->pos += n;
+
+                        if (write_bytes) {
+                            *write_bytes += n;
+                        }
+
+                        if (b->pos == b->last) {
+                            b->pos = b->start;
+                            b->last = b->start;
+                        }
+                    }
+
+                    if(forward_ip &&
+                       s->forwarder_state->buffer->last - s->forwarder_state->buffer->pos > 0) {
+
+                        forward_result = ngx_tcp_proxy_forwarding_restore_buffer(s->connection, s->forwarder_state, b);
+
+                        if (forward_result != 0) {
+                            ngx_log_error(NGX_LOG_ERR, c->log, 0, "restore buffer error");
+
+                            ngx_tcp_finalize_session(s);
+                            return;
+                        }
+
+                        forward_restore = 1;
                     }
                 }
             }
@@ -500,8 +587,6 @@ ngx_tcp_proxy_handler(ngx_event_t *ev)
         ngx_tcp_finalize_session(s);
         return;
     }
-
-    pcf = ngx_tcp_get_module_srv_conf(s, ngx_tcp_proxy_module);
 
     if (c == s->connection) {
         ngx_add_timer(c->read, cscf->timeout);
@@ -583,6 +668,9 @@ ngx_tcp_proxy_create_conf(ngx_conf_t *cf)
     pcf->upstream.send_timeout = NGX_CONF_UNSET_MSEC;
     pcf->upstream.read_timeout = NGX_CONF_UNSET_MSEC;
 
+    pcf->forward_source_ip = NGX_CONF_UNSET;
+    pcf->forward_once = NGX_CONF_UNSET;
+
     return pcf;
 }
 
@@ -604,6 +692,17 @@ ngx_tcp_proxy_merge_conf(ngx_conf_t *cf, void *parent, void *child)
 
     ngx_conf_merge_msec_value(conf->upstream.read_timeout,
                               prev->upstream.read_timeout, 60000);
+
+    ngx_conf_merge_value(conf->forward_source_ip, prev->forward_source_ip, 0);
+
+    if(!conf->forward_source_ip && conf->forward_once != NGX_CONF_UNSET)
+    {
+        ngx_log_error(NGX_LOG_EMERG, cf->log, 0, "forward_once can be set only if forward_source_ip is true");
+
+        return NGX_CONF_ERROR;
+    }
+
+    ngx_conf_merge_value(conf->forward_once, prev->forward_once, 1);
 
     return NGX_CONF_OK;
 }
