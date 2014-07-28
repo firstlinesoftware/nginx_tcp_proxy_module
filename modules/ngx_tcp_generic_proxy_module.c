@@ -454,10 +454,12 @@ ngx_tcp_proxy_handler(ngx_event_t *ev)
                     s->forwarded_once = 1;
                     forward_cycle = forward_result > 0 ? 1 : 0;
 
-                    if(forward_cycle)
+                    if(forward_cycle) 
+                    {
                       ngx_log_debug1(NGX_LOG_DEBUG_TCP, ev->log, 0,
                                      "tcp proxy handler ip forwarding not all data fit in original buffer:%d",
                                      forward_result);
+                    }
 
                 } else {
 
